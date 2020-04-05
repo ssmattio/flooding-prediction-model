@@ -1,0 +1,232 @@
+---
+title: "Forecasting Flood Inundation through Machine Learning in Calgary and Spokane"
+author: "Sara Mattio and Ilil Feiglin"
+date: "3/25/2020"
+output: 
+  html_document:
+    theme: spacelab
+    highlight: tango
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r include= FALSE}
+library(caret)
+library(pscl)
+library(plotROC)
+library(pROC)
+library(sf)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(viridis)
+library(ggplot2)
+library(grid)
+library(gridExtra)
+
+options(scipen=999)
+options(tigris_class = "sf")
+```
+
+
+```{r include=FALSE}
+mapTheme <- function(base_size = 12) {
+  theme(
+    text = element_text( color = "black"),
+    plot.title = element_text(size = 14,colour = "black"),
+    plot.subtitle=element_text(face="italic"),
+    plot.caption=element_text(hjust=0),
+    axis.ticks = element_blank(),
+    panel.background = element_blank(),axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black", fill=NA, size=2)
+  )
+}
+
+Spk <- st_read("C:/Users/ssmat/Desktop/CPLN675/Midterm/Spokane/fishnetCitySpk.shp")
+Spk <- Spk %>%
+  dplyr::select(-OID_,-Shape_Leng,-Shape_Area,-LU1,-LU2,-LU3) %>%
+  st_transform(crs=4326) 
+Spk[is.na(Spk)] <- 0
+
+Clg <- st_read("C:/Users/ssmat/Desktop/CPLN675/Midterm/Calgary/Calgary_Fishnet.shp")
+Clg <- Clg %>%
+  dplyr::select(-Id) %>%
+  st_transform(crs=4326)
+Clg[is.na(Clg)] <- 0
+```
+
+```{r include=FALSE}
+set.seed(3456)
+trainIndex <- createDataPartition(Clg$inundation, p = .70,
+                                  list = FALSE,
+                                  times = 1)
+
+BothTrain <- Clg[ trainIndex,]
+BothTest  <- Clg[-trainIndex,]
+
+ClgModel <- glm(inundation ~ ., 
+                     family="binomial"(link="logit"), data = BothTrain %>%
+                       as.data.frame() %>%
+                       dplyr::select(-geometry))
+
+classProbs <- predict(ClgModel, Clg, type="response")
+testProbs <- data.frame(obs = as.numeric(Clg$inundation),
+                        pred = classProbs)
+
+ctrl <- trainControl(method = "cv", 
+                     number = 100, 
+                     savePredictions = TRUE)
+clgNoGeo <- Clg %>% as.data.frame() %>% dplyr::select(-geometry)
+cvFit <- caret::train(as.factor(inundation) ~ .,  data = clgNoGeo,
+               method="glm", family="binomial",
+               trControl = ctrl)
+
+BothTrainNoG <- BothTrain %>%
+  st_set_geometry(NULL)
+trainingsetPred <- predict(cvFit, BothTrainNoG, type="prob")[,2]
+TSWithPred <- 
+  cbind(BothTrain,trainingsetPred) %>%
+  mutate(trainingsetPred = round(trainingsetPred * 100))%>%
+  mutate(predYN = ifelse(trainingsetPred == "0",0,1))%>%
+  mutate(trueFalse = ifelse(inundation == "1" & predYN == "1","True_Positive",
+                            ifelse(inundation == "1" & predYN == "0","False_Negative",
+                                   ifelse(inundation == "0" & predYN == "1","False_Negative",
+                                   "True_negative"))))
+
+allPredictions <- 
+  predict(cvFit, clgNoGeo, type="prob")[,2]
+ClgWithPred <- 
+  cbind(Clg,allPredictions) %>%
+  mutate(allPredictions = round(allPredictions * 100))
+
+SpkPredictions2 <- 
+  predict(ClgModel, SpkNoGeo, type="response")
+SpkWithPred2 <- 
+  cbind(Spk,SpkPredictions2) 
+SpkWithPred3 <- SpkWithPred2 %>%
+  mutate(predYN = ifelse(SpkPredictions2 > 0.3,1,0))
+SpkWithPred3 <- SpkWithPred3 %>%
+  mutate(trueFalse = ifelse(inundation == "1" & predYN == "1","True_Positive",
+                            ifelse(inundation == "1" & predYN == "0","False_Negative",
+                                   ifelse(inundation == "0" & predYN == "1","False_Positive",
+                                          "True_negative"))))
+```
+
+# Introduction
+In a time of growing uncertainty around climate changes and the future of climate ecosystems on one hand, and great technological innovations on other, there are both the need and the competence of monitoring floods for various planning purposes. It is more critical than ever for environmental protection, disaster response, and regional planning agencies to prepare for potentially increasing flooding. A key tool in flood preparedness is the ability to predict where flooding is likely to take place. The machine learning model outlined in this report does exactly that. This tool combines geospatial analysis with hydrodynamics to build a digital model of the region and simulate the effects of flooding. By deploying data-driven techniques to interpret City data, the model predicts the likelihood of an area being inundated by flooding. Its role will be to monitor current and future trends to allow civil servants to produce alerts, recommendations, future scenarios reports, and periodical predictions with the data. Analysts can then observe areas at immediate risk and areas potentially at risk in the long term. The goal of developing this model is to integrate it into the working practices of local government and further improve the model by integrating different departments' datasets and needs. Ultimately, the tool will promote responsible growth and prepare residents of a metropolitan area for potential flooding through actionable intelligence. 
+
+# Feature Engineering
+
+When developing the model, several potential indicators stood out as significant in Calgary. Both elevation and distance to stream were statistically significant. Initially, stream length was not a significant variable; however, when elevation is dropped from the model, the stream length variable becomes significant. It is possible that multicollinearity exists with elevation and stream length. Although land use variables are not significant in the model, residential land that is not low density (labeled `Residential Land` in the map below) has P value of 0.14, which is relativly low and therefore worth considering. 
+
+```{r echo=FALSE, message = FALSE, warning = FALSE}
+LenPlot <- 
+  ggplot() +
+    geom_sf(data = Clg, aes(fill=LEN)) + 
+    scale_fill_viridis(name="Stream \nLength") +
+    mapTheme()
+
+ElevPlot <- 
+  ggplot() +
+    geom_sf(data=Clg, aes(fill=ELEV)) + 
+    scale_fill_viridis(name="Elevation") +
+    mapTheme()
+
+developedPlot <- 
+  ggplot() +
+    geom_sf(data=Clg, aes(fill=LUresL)) + 
+    scale_fill_viridis(name="Residential \nLand") +
+    mapTheme()
+
+streamPlot <- 
+  ggplot() +
+    geom_sf(data=Clg, aes(fill=DistStr)) + 
+    scale_fill_viridis(name="Distance \nto Stream") +
+    mapTheme()
+
+grid.arrange(LenPlot, ElevPlot, developedPlot, streamPlot, ncol=2)
+```
+
+# Model Summary
+
+Using a linear regression model, six indicators were incorporated to predict the likelihood of a location experiencing flood inundation. These features include slope, elevation, land use, zoning, stream length, and distance to a stream. The summary of the model is included below, starting with the ROC curve. The curve shows the trade-off between sensitivity, the proportion of actual positives that were predicted to be positive, and specificity, the proportion of actual negatives that were predicted to be negatives. The plot below shows that the specificity of the model is very high, while the sensitivity is much lower. The curve tells us that the model is better at predicting areas that did not flood, while not as good at predicting areas that did flood.
+
+```{r echo=FALSE, message = FALSE, warning = FALSE}
+ggplot(testProbs, aes(d = obs, m = pred)) + 
+  geom_roc(n.cuts = 50, labels = FALSE) + 
+  style_roc(theme = theme_grey) +
+  geom_abline(slope = 1, intercept = 0, size = 1.5, color = 'grey') 
+```
+
+
+The confusion matrix below provides further detail of the model, most notably the amount of true positives, true negatives, false positives, and false negatives. The model is accurately predicting areas that did not flood, while finding fewer areas that did flood.
+
+```{r echo=FALSE, message = FALSE, warning = FALSE}
+testProbs$predClass  = ifelse(testProbs$pred > .3 ,1,0)
+
+caret::confusionMatrix(reference = as.factor(testProbs$obs), 
+                       data = as.factor(testProbs$predClass), 
+                       positive = "1")
+```
+
+Further confirming the model's ability to predict inundated vs. non-inundated areas, the two plots below show the probability of the model predicting accurately. The model is less likely to accurately predict an inundated area. 
+
+```{r echo=FALSE, message = FALSE, warning = FALSE}
+ggplot(testProbs, aes(x = pred, fill=as.factor(obs))) + geom_density() +
+  facet_grid(obs ~ .) + xlab("Probability") + geom_vline(xintercept = .5) +
+  scale_fill_manual(values = c("dodgerblue4", "darkgreen"),
+                    labels = c("Not Inundated","Inundated"),
+                    name = "")
+```
+
+This plot shows the spread of accuracy across 100 folds. For a model to be generalizable, there should not be a range of different accuracies. Therefore, the results of this plot indicate that our model may be generalizable enough to accurately predict with Spokane's data.
+
+```{r echo=FALSE, message = FALSE, warning = FALSE}
+ggplot(as.data.frame(cvFit$resample), aes(Accuracy)) + 
+  geom_histogram() +
+  scale_x_continuous(limits = c(0, 1)) +
+  labs(x="Accuracy",
+       y="Count")
+```
+
+
+Finally, the model has an AUC (area under the curve) value of 0.88. A model whose predictions are 100% wrong has an AUC of 0, while one whose predictions are 100% correct has an AUC of 1. Therefore, the model seems to be pretty good at predicting correctly for Calgary.
+
+# Results
+The map below shows the results of running the model on the training set. The results seem to be clustered together, indicating that True Positives, True Negatives, and False Negatives seem to be grouped together. Note that any blank spaces in the map are a result of those areas not being included in the training set. 
+```{r echo=FALSE, message = FALSE, warning = FALSE}
+ggplot() + 
+  geom_sf(data=TSWithPred, aes(fill=factor(trueFalse))) +
+  mapTheme() +
+  labs(title="Training Set Results for Calgary")
+```
+
+When the model is used to predict inundation for the entire city of Calgary, it seems to predict that flooding is more likely to take place in the center and southern regions of the city, rather than the north. Given the higher elevation and slope in the north, which could result in water running downstream towards the south, the prediction seems fairly accurate. 
+```{r echo=FALSE, message = FALSE, warning = FALSE}
+ggplot() + 
+  geom_sf(data=ClgWithPred, aes(fill=factor(ntile(allPredictions,5))), colour=NA) +
+  scale_fill_manual(values = c("#edf8fb","#b3cde3","#8c96c6","#8856a7","#810f7c"),
+                    labels=as.character(quantile(ClgWithPred$allPredictions,
+                                                 c(0.1,.2,.4,.6,.8),na.rm=T)),
+                    name="Predicted\nProbabilities(%)\n(Quintile\nBreaks)") +
+  mapTheme() +
+  labs(title="Predicted Inundation for Calgary")
+```
+
+Finally, the model was then utilized with Data from Spokane, WA to test if the model was generalizable enough to predict inundation in another city. 
+```{r echo=FALSE, message = FALSE, warning = FALSE}
+ggplot() + 
+  geom_sf(data=SpkWithPred2, aes(fill=factor(ntile(SpkPredictions2,5)))) +
+  mapTheme() +
+  labs(title="Predicted Inundation for Spokane")
+```
+
+
